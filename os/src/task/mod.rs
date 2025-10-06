@@ -17,6 +17,7 @@ mod task;
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
+use alloc::collections::btree_map::BTreeMap;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
@@ -45,6 +46,8 @@ pub struct TaskManagerInner {
     tasks: [TaskControlBlock; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
+    /// map of sys_call trace of current task
+    trace_map: BTreeMap<usize, BTreeMap<usize, usize>>,
 }
 
 lazy_static! {
@@ -65,6 +68,7 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    trace_map: BTreeMap::new(),
                 })
             },
         }
@@ -158,6 +162,21 @@ fn mark_current_exited() {
     TASK_MANAGER.mark_current_exited();
 }
 
+/// log sys_call trace info of current task
+pub fn trace_sys_call(id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+
+    let current = inner.current_task;
+
+    inner
+        .trace_map
+        .entry(current)
+        .or_default()
+        .entry(id)
+        .and_modify(|e| *e += 1)
+        .or_insert(1);
+}
+
 /// Suspend the current 'Running' task and run the next task in task list.
 pub fn suspend_current_and_run_next() {
     mark_current_suspended();
@@ -168,4 +187,16 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Get the count of a specific sys_call of current task.
+pub fn get_sys_call_count(id: usize) -> usize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+
+    inner
+        .trace_map
+        .get(&current)
+        .and_then(|m| m.get(&id).copied())
+        .unwrap_or(0)
 }
