@@ -1,4 +1,5 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
+#![allow(missing_docs)]
 
 use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
@@ -63,6 +64,109 @@ impl MemorySet {
             None,
         );
     }
+
+    /// Remove a framed area from memory set
+    pub fn unmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        // find the areas that overlap with [start_va, end_va)
+        let left_area_index = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() <= start_va.floor()
+                && area.vpn_range.get_end() > start_va.floor()
+        });
+
+        let right_area_index = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() < end_va.ceil() && area.vpn_range.get_end() >= end_va.ceil()
+        });
+
+        if let (Some(left_index), Some(right_index)) = (left_area_index, right_area_index) {
+            // the [start_va, end_va) is within one area
+            // split the area into two areas if necessary
+            if left_index == right_index {
+                let vpn_range_to_remove = VPNRange::new(start_va.floor(), end_va.ceil());
+                let mut old_area = self.areas.swap_remove(left_index);
+                let left_range = VPNRange::new(old_area.vpn_range.get_start(), start_va.floor());
+                let right_range = VPNRange::new(end_va.ceil(), old_area.vpn_range.get_end());
+
+                for vpn in vpn_range_to_remove {
+                    old_area.unmap_one(&mut self.page_table, vpn);
+                }
+
+                let mut left_data_frames = BTreeMap::new();
+                let mut right_data_frames = BTreeMap::new();
+
+                for (vpn, frame) in old_area.data_frames.into_iter() {
+                    if left_range.get_start() != left_range.get_end()
+                        && vpn >= left_range.get_start()
+                        && vpn < left_range.get_end()
+                    {
+                        left_data_frames.insert(vpn, frame);
+                    } else if right_range.get_start() != right_range.get_end()
+                        && vpn >= right_range.get_start()
+                        && vpn < right_range.get_end()
+                    {
+                        right_data_frames.insert(vpn, frame);
+                    }
+                }
+
+                if left_range.get_start() != left_range.get_end() {
+                    let left_area = MapArea {
+                        vpn_range: left_range,
+                        data_frames: left_data_frames,
+                        map_type: old_area.map_type,
+                        map_perm: old_area.map_perm,
+                    };
+                    self.areas.push(left_area);
+                }
+                if right_range.get_start() != right_range.get_end() {
+                    let right_area = MapArea {
+                        vpn_range: right_range,
+                        data_frames: right_data_frames,
+                        map_type: old_area.map_type,
+                        map_perm: old_area.map_perm,
+                    };
+                    self.areas.push(right_area);
+                }
+                return true;
+            }
+
+            // the [start_va, end_va) spans multiple areas
+            // remove all areas between and shrink the left and right areas if necessary
+            if left_index < right_index {
+                self.areas
+                    .drain((left_index + 1)..right_index)
+                    .for_each(|mut area| area.unmap(&mut self.page_table));
+
+                let left_area = &mut self.areas[left_index];
+                left_area.shrink_to(
+                    &mut self.page_table,
+                    left_area.vpn_range.get_start(),
+                    start_va.floor(),
+                );
+
+                let right_area = &mut self.areas[right_index];
+                right_area.shrink_to(
+                    &mut self.page_table,
+                    end_va.ceil(),
+                    right_area.vpn_range.get_end(),
+                );
+
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if the range [start_va, end_va) is fully mapped
+    pub fn has_fully_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let check_range = VPNRange::new(start_va.floor(), end_va.ceil());
+        for vpn in check_range {
+            if self.translate(vpn).is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&mut self.page_table);
         if let Some(data) = data {
@@ -235,13 +339,13 @@ impl MemorySet {
     }
     /// shrink the area to new_end
     #[allow(unused)]
-    pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
+    pub fn shrink_to(&mut self, start: VirtAddr, new_start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self
             .areas
             .iter_mut()
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
-            area.shrink_to(&mut self.page_table, new_end.ceil());
+            area.shrink_to(&mut self.page_table, new_start.floor(), new_end.ceil());
             true
         } else {
             false
@@ -261,6 +365,21 @@ impl MemorySet {
         } else {
             false
         }
+    }
+
+    /// Check if the range [start_va, end_va) has been mapped
+    pub fn has_mapped(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        let new_range = VPNRange::new(start.floor(), end.ceil());
+        for area in &self.areas {
+            if area
+                .vpn_range
+                .into_iter()
+                .any(|vpn| new_range.contains(vpn))
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 /// map area structure, controls a contiguous piece of virtual memory
@@ -321,12 +440,29 @@ impl MapArea {
         }
     }
     #[allow(unused)]
-    pub fn shrink_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
+    pub fn shrink_to(
+        &mut self,
+        page_table: &mut PageTable,
+        new_start: VirtPageNum,
+        new_end: VirtPageNum,
+    ) {
+        if new_start < self.vpn_range.get_start()
+            || new_end > self.vpn_range.get_end()
+            || new_start >= new_end
+        {
+            return;
+        }
+
         for vpn in VPNRange::new(new_end, self.vpn_range.get_end()) {
             self.unmap_one(page_table, vpn)
         }
-        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+        for vpn in VPNRange::new(self.vpn_range.get_start(), new_start) {
+            self.unmap_one(page_table, vpn)
+        }
+
+        self.vpn_range = VPNRange::new(new_start, new_end);
     }
+
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {

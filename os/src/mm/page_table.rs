@@ -1,6 +1,10 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 
-use super::{frame_alloc, FrameTracker, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::mm::PhysAddr;
+
+use super::{
+    frame_alloc, FrameTracker, MapPermission, PhysPageNum, StepByOne, VirtAddr, VirtPageNum,
+};
 use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::*;
@@ -69,6 +73,11 @@ impl PageTableEntry {
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
+    }
+
+    /// The page pointered by page table entry is user accessible?
+    pub fn is_user(&self) -> bool {
+        (self.flags() & PTEFlags::U) != PTEFlags::empty()
     }
 }
 
@@ -178,4 +187,58 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
         start = end_va.into();
     }
     v
+}
+
+/// Translate a struct ptr of user address space to a mutable reference
+/// note that this function can not process a struct splitted by two pages
+pub fn translated_refmut<T>(token: usize, ptr: *const T, is_user: bool) -> Option<&'static mut T> {
+    let va = VirtAddr::from(ptr as usize);
+    translate_virt_to_phys(
+        token,
+        va,
+        if is_user {
+            MapPermission::U | MapPermission::R | MapPermission::W
+        } else {
+            MapPermission::R | MapPermission::W
+        },
+    )
+    .map(|pa| pa.get_mut::<T>())
+}
+
+/// Translate a struct ptr of user address space to a reference
+/// note that this function can not process a struct splitted by two pages
+pub fn translated_ref<T>(token: usize, ptr: *const T, is_user: bool) -> Option<&'static T> {
+    let va = VirtAddr::from(ptr as usize);
+    translate_virt_to_phys(
+        token,
+        va,
+        if is_user {
+            MapPermission::U | MapPermission::R
+        } else {
+            MapPermission::R
+        },
+    )
+    .map(|pa| pa.get_mut::<T>() as &'static T)
+}
+
+/// Translate a virtual address to a physical address with permission check
+pub fn translate_virt_to_phys(
+    token: usize,
+    va: VirtAddr,
+    permission: MapPermission,
+) -> Option<PhysAddr> {
+    let page_table = PageTable::from_token(token);
+    let vpn = va.floor();
+    let pte = page_table.translate(vpn)?;
+
+    // Permission check
+    if permission.contains(MapPermission::R) && !pte.readable()
+        || permission.contains(MapPermission::R | MapPermission::W) && !pte.writable()
+        || permission.contains(MapPermission::U) && !pte.is_user()
+    {
+        return None;
+    }
+
+    let pa: PhysAddr = pte.ppn().into();
+    Some(pa.combine_with_offset(va.page_offset()))
 }

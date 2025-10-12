@@ -142,6 +142,12 @@ impl PhysAddr {
     pub fn aligned(&self) -> bool {
         self.page_offset() == 0
     }
+
+    /// Combine with page offset to get the physical address
+    pub fn combine_with_offset(&self, offset: usize) -> Self {
+        assert!(offset < PAGE_SIZE);
+        PhysAddr(self.0 - self.page_offset() + offset)
+    }
 }
 impl From<PhysAddr> for PhysPageNum {
     fn from(v: PhysAddr) -> Self {
@@ -226,6 +232,9 @@ where
     }
     pub fn get_end(&self) -> T {
         self.r
+    }
+    pub fn contains(&self, t: T) -> bool {
+        self.l <= t && t < self.r
     }
 }
 impl<T> IntoIterator for SimpleRange<T>

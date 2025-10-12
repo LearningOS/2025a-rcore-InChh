@@ -15,8 +15,11 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
+use crate::syscall::PortPermission;
 use crate::trap::TrapContext;
+use alloc::collections::btree_map::BTreeMap;
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
@@ -40,12 +43,20 @@ pub struct TaskManager {
     inner: UPSafeCell<TaskManagerInner>,
 }
 
+/// The syscall info struct for trace
+pub struct SysCallInfo {
+    id: usize,
+    times: usize,
+}
+
 /// The task manager inner in 'UPSafeCell'
 struct TaskManagerInner {
     /// task list
     tasks: Vec<TaskControlBlock>,
     /// id of current `Running` task
     current_task: usize,
+    /// syscall trace map, key: task id, value: SysCallInfo
+    trace_map: BTreeMap<usize, Vec<SysCallInfo>>,
 }
 
 lazy_static! {
@@ -64,6 +75,7 @@ lazy_static! {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    trace_map: BTreeMap::new(),
                 })
             },
         }
@@ -201,4 +213,69 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Log the syscall info for trace
+pub fn trace_sys_call(id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner
+        .trace_map
+        .entry(current)
+        .and_modify(|vec| {
+            if let Some(info) = vec.iter_mut().find(|info| info.id == id) {
+                info.times += 1;
+            } else {
+                vec.push(SysCallInfo { id, times: 1 });
+            }
+        })
+        .or_insert(alloc::vec![SysCallInfo { id, times: 1 }]);
+}
+
+/// Get the syscall trace info
+pub fn get_trace_info(id: usize) -> usize {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    inner
+        .trace_map
+        .get(&inner.current_task)
+        .and_then(|vec| vec.iter().find(|info| info.id == id))
+        .map_or(0, |info| info.times)
+}
+
+/// Insert a framed area to current task's memory set
+pub fn insert_framed_area_to_current_task(start: usize, len: usize, port: PortPermission) -> bool {
+    let start_va = VirtAddr::from(start);
+    // start address must be page-aligned
+    if !start_va.aligned() {
+        return false;
+    }
+    let end_va: VirtAddr = VirtAddr::from(start + len);
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    let memory_set = &mut inner.tasks[cur].memory_set;
+    // check if there has any overlap with existing areas
+    if memory_set.has_mapped(start_va, end_va) {
+        return false;
+    }
+    let permission = MapPermission::from(port) | MapPermission::U;
+    memory_set.insert_framed_area(start_va, end_va, permission);
+    true
+}
+
+/// Remove a framed area from current task's memory set
+pub fn remove_framed_area_from_current_task(start: usize, len: usize) -> bool {
+    let start_va = VirtAddr::from(start);
+    // start address must be page-aligned
+    if !start_va.aligned() {
+        return false;
+    }
+    let end_va: VirtAddr = VirtAddr::from(start + len);
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let cur = inner.current_task;
+    let memory_set = &mut inner.tasks[cur].memory_set;
+    if !memory_set.has_fully_mapped(start_va, end_va) {
+        return false;
+    }
+
+    memory_set.unmap(start_va, end_va)
 }

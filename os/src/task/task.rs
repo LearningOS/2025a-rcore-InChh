@@ -83,8 +83,11 @@ impl TaskControlBlock {
             return None;
         }
         let result = if size < 0 {
-            self.memory_set
-                .shrink_to(VirtAddr(self.heap_bottom), VirtAddr(new_brk as usize))
+            self.memory_set.shrink_to(
+                VirtAddr(self.heap_bottom),
+                VirtAddr(self.heap_bottom),
+                VirtAddr(new_brk as usize),
+            )
         } else {
             self.memory_set
                 .append_to(VirtAddr(self.heap_bottom), VirtAddr(new_brk as usize))
