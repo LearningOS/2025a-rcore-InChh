@@ -339,13 +339,13 @@ impl MemorySet {
     }
     /// shrink the area to new_end
     #[allow(unused)]
-    pub fn shrink_to(&mut self, start: VirtAddr, new_start: VirtAddr, new_end: VirtAddr) -> bool {
+    pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
         if let Some(area) = self
             .areas
             .iter_mut()
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
-            area.shrink_to(&mut self.page_table, new_start.floor(), new_end.ceil());
+            area.shrink_to(&mut self.page_table, area.vpn_range.get_start(), new_end.ceil());
             true
         } else {
             false
@@ -465,6 +465,9 @@ impl MapArea {
 
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
+        if new_end <= self.vpn_range.get_end() {
+            return;
+        }
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {
             self.map_one(page_table, vpn)
         }
