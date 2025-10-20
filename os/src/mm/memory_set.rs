@@ -300,6 +300,116 @@ impl MemorySet {
             false
         }
     }
+
+    /// Check whether all pages in [start_va, end_va) are already mapped.
+    /// Return true if all pages are mapped, false otherwise.
+    pub fn has_fully_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let range = VPNRange::new(start_va.floor(), end_va.ceil());
+        for vpn in range {
+            if self.translate(vpn).is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Remove the mapping of [start_va, end_va).
+    /// Return true if success, false otherwise.
+    pub fn remove_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let range_to_remove = VPNRange::new(start_va.floor(), end_va.ceil());
+        // find the leftmost area and rightmost area index
+        let leftmost_area_index = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() < start_va.floor()
+                && area.vpn_range.get_end() > start_va.floor()
+        });
+        let rightmost_area_index = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() < end_va.floor() && area.vpn_range.get_end() > end_va.floor()
+        });
+        if let (Some(left_idx), Some(right_idx)) = (leftmost_area_index, rightmost_area_index) {
+            if left_idx == right_idx {
+                // only one area, split it into two areas if not fully covered
+                let left_range = VPNRange::new(
+                    self.areas[left_idx].vpn_range.get_start(),
+                    range_to_remove.get_start(),
+                );
+                let right_range = VPNRange::new(
+                    range_to_remove.get_end(),
+                    self.areas[left_idx].vpn_range.get_end(),
+                );
+                let mut left_data_frames = BTreeMap::new();
+                let mut right_data_frames = BTreeMap::new();
+
+                let old_area = self.areas.swap_remove(left_idx);
+                for (vpn, frame) in old_area.data_frames.into_iter() {
+                    if left_range.contains(vpn) {
+                        left_data_frames.insert(vpn, frame);
+                    } else if right_range.contains(vpn) {
+                        right_data_frames.insert(vpn, frame);
+                    } else {
+                        self.page_table.unmap(vpn);
+                    }
+                }
+                if left_range.get_start() != left_range.get_end() {
+                    let left_area = MapArea {
+                        vpn_range: left_range,
+                        data_frames: left_data_frames,
+                        map_type: old_area.map_type,
+                        map_perm: old_area.map_perm,
+                    };
+                    self.areas.insert(left_idx, left_area);
+                }
+                if right_range.get_start() != right_range.get_end() {
+                    let right_area = MapArea {
+                        vpn_range: right_range,
+                        data_frames: right_data_frames,
+                        map_type: old_area.map_type,
+                        map_perm: old_area.map_perm,
+                    };
+                    self.areas.insert(left_idx, right_area);
+                }
+                return true;
+            }
+
+            if left_idx < right_idx {
+                // remove areas in between
+                let removed_areas = self.areas.drain(left_idx + 1..right_idx);
+                for mut area in removed_areas {
+                    area.unmap(&mut self.page_table);
+                }
+
+                // shrink left area
+                if range_to_remove.get_start() > self.areas[left_idx].vpn_range.get_start() {
+                    self.areas[left_idx]
+                        .shrink_to(&mut self.page_table, range_to_remove.get_start());
+                } else {
+                    // fully covered, remove it
+                    let mut area = self.areas.remove(left_idx);
+                    area.unmap(&mut self.page_table);
+                }
+
+                // shrink right area
+                if range_to_remove.get_end() < self.areas[right_idx].vpn_range.get_end() {
+                    let range = VPNRange::new(
+                        self.areas[right_idx].vpn_range.get_start(),
+                        range_to_remove.get_end(),
+                    );
+                    for vpn in range {
+                        self.areas[right_idx].unmap_one(&mut self.page_table, vpn);
+                    }
+                    self.areas[right_idx].vpn_range = VPNRange::new(
+                        range_to_remove.get_end(),
+                        self.areas[right_idx].vpn_range.get_end(),
+                    );
+                } else {
+                    // fully covered, remove it
+                    let mut area = self.areas.remove(right_idx);
+                    area.unmap(&mut self.page_table);
+                }
+                return true;
+            }
+        }
+        false
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {

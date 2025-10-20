@@ -8,6 +8,10 @@ use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::cmp::Ordering;
+use core::ops::{Deref, DerefMut};
+
+pub const BIG_STRIDE: u64 = 255;
 
 /// Task control block structure
 ///
@@ -68,6 +72,58 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Priority of the task
+    pub priority: usize,
+
+    /// Stride of the task
+    pub stride: Stride,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Stride(u64);
+
+impl Stride {
+    pub fn new(value: u64) -> Self {
+        Stride(value)
+    }
+}
+
+impl Deref for Stride {
+    type Target = u64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Stride {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<u64> for Stride {
+    fn from(value: u64) -> Self {
+        Stride(value)
+    }
+}
+
+impl PartialOrd for Stride {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let half = BIG_STRIDE / 2;
+        if self.0.wrapping_sub(other.0) > half {
+            Some(Ordering::Less)
+        } else {
+            Some(Ordering::Greater)
+        }
+    }
+}
+
+impl PartialEq for Stride {
+    fn eq(&self, _other: &Self) -> bool {
+        false
+    }
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +174,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 16,
+                    stride: 0.into(),
                 })
             },
         };
@@ -191,6 +249,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: parent_inner.priority,
+                    stride: parent_inner.stride,
                 })
             },
         });
