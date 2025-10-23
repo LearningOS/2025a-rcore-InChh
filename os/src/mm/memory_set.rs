@@ -301,54 +301,75 @@ impl MemorySet {
         }
     }
 
-    /// Check whether all pages in [start_va, end_va) are already mapped.
-    /// Return true if all pages are mapped, false otherwise.
-    pub fn has_fully_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
-        let range = VPNRange::new(start_va.floor(), end_va.ceil());
-        for vpn in range {
-            if self.translate(vpn).is_none() {
-                return false;
+    /// Check if the range [start_va, end_va) has been mapped
+    pub fn has_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let new_range = VPNRange::new(start_va.floor(), end_va.ceil());
+        for area in &self.areas {
+            if area
+                .vpn_range
+                .into_iter()
+                .any(|vpn| new_range.contains(vpn))
+            {
+                return true;
             }
         }
-        true
+        false
+    }
+
+    /// Check if the range [start_va, end_va) has been fully mapped
+    pub fn has_fully_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let new_range = VPNRange::new(start_va.floor(), end_va.ceil());
+        let mut covered_vpn_count = 0;
+        for area in &self.areas {
+            for vpn in area.vpn_range {
+                if new_range.contains(vpn) {
+                    covered_vpn_count += 1;
+                }
+            }
+        }
+        covered_vpn_count == new_range.len()
     }
 
     /// Remove the mapping of [start_va, end_va).
     /// Return true if success, false otherwise.
     pub fn remove_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
-        let range_to_remove = VPNRange::new(start_va.floor(), end_va.ceil());
-        // find the leftmost area and rightmost area index
-        let leftmost_area_index = self.areas.iter().position(|area| {
-            area.vpn_range.get_start() < start_va.floor()
+        // find the areas that overlap with [start_va, end_va)
+        let left_area_index = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() <= start_va.floor()
                 && area.vpn_range.get_end() > start_va.floor()
         });
-        let rightmost_area_index = self.areas.iter().position(|area| {
-            area.vpn_range.get_start() < end_va.floor() && area.vpn_range.get_end() > end_va.floor()
+
+        let right_area_index = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() < end_va.ceil() && area.vpn_range.get_end() >= end_va.ceil()
         });
-        if let (Some(left_idx), Some(right_idx)) = (leftmost_area_index, rightmost_area_index) {
+        if let (Some(left_idx), Some(right_idx)) = (left_area_index, right_area_index) {
+            let range_to_remove = VPNRange::new(start_va.floor(), end_va.ceil());
             if left_idx == right_idx {
-                // only one area, split it into two areas if not fully covered
-                let left_range = VPNRange::new(
-                    self.areas[left_idx].vpn_range.get_start(),
-                    range_to_remove.get_start(),
-                );
-                let right_range = VPNRange::new(
-                    range_to_remove.get_end(),
-                    self.areas[left_idx].vpn_range.get_end(),
-                );
+                let mut old_area = self.areas.swap_remove(left_idx);
+                let left_range = VPNRange::new(old_area.vpn_range.get_start(), start_va.floor());
+                let right_range = VPNRange::new(end_va.ceil(), old_area.vpn_range.get_end());
+
+                for vpn in range_to_remove {
+                    old_area.unmap_one(&mut self.page_table, vpn);
+                }
+
                 let mut left_data_frames = BTreeMap::new();
                 let mut right_data_frames = BTreeMap::new();
 
-                let old_area = self.areas.swap_remove(left_idx);
                 for (vpn, frame) in old_area.data_frames.into_iter() {
-                    if left_range.contains(vpn) {
+                    if left_range.get_start() != left_range.get_end()
+                        && vpn >= left_range.get_start()
+                        && vpn < left_range.get_end()
+                    {
                         left_data_frames.insert(vpn, frame);
-                    } else if right_range.contains(vpn) {
+                    } else if right_range.get_start() != right_range.get_end()
+                        && vpn >= right_range.get_start()
+                        && vpn < right_range.get_end()
+                    {
                         right_data_frames.insert(vpn, frame);
-                    } else {
-                        self.page_table.unmap(vpn);
                     }
                 }
+
                 if left_range.get_start() != left_range.get_end() {
                     let left_area = MapArea {
                         vpn_range: left_range,
@@ -356,7 +377,7 @@ impl MemorySet {
                         map_type: old_area.map_type,
                         map_perm: old_area.map_perm,
                     };
-                    self.areas.insert(left_idx, left_area);
+                    self.areas.push(left_area);
                 }
                 if right_range.get_start() != right_range.get_end() {
                     let right_area = MapArea {
@@ -365,7 +386,7 @@ impl MemorySet {
                         map_type: old_area.map_type,
                         map_perm: old_area.map_perm,
                     };
-                    self.areas.insert(left_idx, right_area);
+                    self.areas.push(right_area);
                 }
                 return true;
             }

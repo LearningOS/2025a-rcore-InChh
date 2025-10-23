@@ -231,6 +231,16 @@ where
     pub fn contains(&self, vpn: T) -> bool {
         self.l <= vpn && vpn < self.r
     }
+    
+    pub fn len(&self) -> i32 {
+        let mut count = 0;
+        let mut current = self.l;
+        while current != self.r {
+            count += 1;
+            current.step();
+        }
+        count
+    }
 }
 impl<T> IntoIterator for SimpleRange<T>
 where

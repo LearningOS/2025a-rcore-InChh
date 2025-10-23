@@ -162,7 +162,7 @@ pub fn sys_mmap(start: usize, len: usize, port: usize) -> isize {
     }
     let end_va = VirtAddr::from(start + len);
     if let Ok(flags) = PortFlags::try_from(port) {
-        if inner.memory_set.has_fully_mapped(start_va, end_va) {
+        if !inner.memory_set.has_mapped(start_va, end_va) {
             inner
                 .memory_set
                 .insert_framed_area(start_va, end_va, flags.into());
